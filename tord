@@ -1,0 +1,600 @@
+#!/bin/bash
+# TorDaemon (tord) - Auto IP Changer
+# Author: @MoE1N
+# Version: 0.1.0
+
+# --- Configuration ---
+CONFIG_FILE="/etc/tord/config"
+PID_FILE="/var/run/tord.pid"
+LOG_FILE="/var/log/tord.log"
+SERVICE_NAME="tord"
+SOCKS_HOST="127.0.0.1"
+SOCKS_PORT="9050"
+CHECK_IP_URL="http://checkip.amazonaws.com"
+INTERVAL=60
+
+# Load configuration if exists
+load_config() {
+    if [ -f "$CONFIG_FILE" ]; then
+        # shellcheck source=/dev/null
+        . "$CONFIG_FILE"
+    fi
+}
+
+save_config() {
+    if [ -w "$CONFIG_FILE" ] || [ "$EUID" -eq 0 ]; then
+        cat > "$CONFIG_FILE" << EOF
+# TorDaemon Configuration
+SOCKS_HOST=$SOCKS_HOST
+SOCKS_PORT=$SOCKS_PORT
+INTERVAL=$INTERVAL
+EOF
+        log_info "Configuration saved to $CONFIG_FILE"
+    else
+        log_error "Cannot write to $CONFIG_FILE. Run with sudo to save configuration."
+        return 1
+    fi
+}
+
+# --- Colors ---
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+CYAN='\033[0;36m'
+YELLOW='\033[1;33m'
+NC='\033[0m' # No Color
+
+# --- Core Functions ---
+
+log_info() {
+    local msg
+    msg="[INFO] $(date '+%Y-%m-%d %H:%M:%S') - $1"
+    if [ -t 1 ]; then
+        echo -e "${GREEN}${msg}${NC}"
+    else
+        echo "$msg" | tee -a "$LOG_FILE" 2>/dev/null || echo "$msg"
+    fi
+}
+
+log_error() {
+    local msg
+    msg="[ERROR] $(date '+%Y-%m-%d %H:%M:%S') - $1"
+    if [ -t 1 ]; then
+        echo -e "${RED}${msg}${NC}"
+    else
+        echo "$msg" | tee -a "$LOG_FILE" 2>/dev/null || echo "$msg" >&2
+    fi
+}
+
+log_warn() {
+    local msg
+    msg="[WARN] $(date '+%Y-%m-%d %H:%M:%S') - $1"
+    if [ -t 1 ]; then
+        echo -e "${YELLOW}${msg}${NC}"
+    else
+        echo "$msg" | tee -a "$LOG_FILE" 2>/dev/null || echo "$msg"
+    fi
+}
+
+print_banner() {
+    clear
+    echo -e "${CYAN}"
+    echo "  ████████╗ ██████╗ ██████╗ ██████╗  "
+    echo "  ╚══██╔══╝██╔═══██╗██╔══██╗██╔══██╗ "
+    echo "     ██║   ██║   ██║██████╔╝██║  ██║ "
+    echo "     ██║   ██║   ██║██╔══██╗██║  ██║ "
+    echo "     ██║   ╚██████╔╝██║  ██║██████╔╝ "
+    echo "     ╚═╝    ╚═════╝ ╚═╝  ╚═╝╚═════╝  "
+    echo "         TorDaemon (tord) v0.1       "
+    echo -e "${NC}"
+}
+
+check_dependencies() {
+    if ! command -v curl &> /dev/null; then
+        log_error "curl is not installed. Please install curl."
+        exit 1
+    fi
+}
+
+check_tor() {
+    # Simple check if Tor appears running
+    if ! pgrep -x "tor" >/dev/null; then
+        log_warn "Tor process not found. Attempting to start..."
+        # Try to start Tor service
+        if command -v systemctl &>/dev/null; then
+            if sudo systemctl start tor 2>/dev/null || sudo systemctl start tor@default 2>/dev/null; then
+                log_info "Tor service started successfully."
+            else
+                log_error "Failed to start Tor service."
+                log_error "Please install Tor: sudo apt install tor (Ubuntu/Debian)"
+                exit 1
+            fi
+        elif command -v brew &>/dev/null; then
+            brew services start tor
+        else
+            log_error "Could not start Tor. Please install and start Tor manually."
+            exit 1
+        fi
+        sleep 3
+    fi
+}
+
+get_current_ip() {
+    curl -s --connect-timeout 5 -x socks5h://$SOCKS_HOST:$SOCKS_PORT "$CHECK_IP_URL"
+}
+
+reload_tor() {
+    # Send SIGHUP to reload configuration and new circuit
+    local tor_pid
+    tor_pid=$(pgrep -x tor | head -n 1)
+    if [ -n "$tor_pid" ]; then
+        if kill -HUP "$tor_pid" 2>/dev/null; then
+             return 0
+        elif sudo kill -HUP "$tor_pid" 2>/dev/null; then
+             return 0
+        fi
+    fi
+    
+    # Fallback to reload command
+    if command -v systemctl &>/dev/null; then
+        sudo systemctl reload tor 2>/dev/null || sudo systemctl reload tor@default 2>/dev/null
+    else
+        sudo pkill -HUP -x tor
+    fi
+}
+
+change_ip_routine() {
+    log_info "Requesting new identity..."
+    reload_tor
+    sleep 3
+    
+    local new_ip
+    new_ip=$(get_current_ip)
+    if [ -n "$new_ip" ]; then
+        log_info "New IP: $new_ip"
+    else
+        log_warn "Failed to get IP. Tor might be stabilizing."
+    fi
+}
+
+run_loop() {
+    local interval=$1
+    print_banner
+    log_info "TorDaemon Started."
+    log_info "Mode: $( [ "$interval" -eq 0 ] && echo "Passive (Disconnect Only)" || echo "Active (${interval}s Interval)" )"
+    
+    local current_ip
+    current_ip=$(get_current_ip)
+    log_info "Current IP: ${current_ip:-Unknown}"
+
+    while true; do
+        if [ "$interval" -gt 0 ]; then
+            sleep "$interval"
+            change_ip_routine
+        else
+            # Passive mode: Check every 30s
+            sleep 30
+            if [ -z "$(get_current_ip)" ]; then
+                log_warn "Connection lost. Refreshing..."
+                change_ip_routine
+            fi
+        fi
+    done
+}
+
+# --- Configuration Menu ---
+
+config_menu() {
+    while true; do
+        print_banner
+        echo -e "${CYAN}=== Configuration ===${NC}"
+        echo ""
+        echo "Current Settings:"
+        echo "  SOCKS Host: $SOCKS_HOST"
+        echo "  SOCKS Port: $SOCKS_PORT"
+        echo "  Interval: ${INTERVAL}s"
+        echo ""
+        echo "1. Change SOCKS Host"
+        echo "2. Change SOCKS Port"
+        echo "3. Change IP Renewal Interval"
+        echo "4. Save Configuration"
+        echo "5. Reset to Defaults"
+        echo "6. Back to Main Menu"
+        echo ""
+        read -r -p "Select option: " choice
+        
+        case "$choice" in
+            1)
+                read -r -p "Enter SOCKS Host [$SOCKS_HOST]: " new_host
+                if [ -n "$new_host" ]; then
+                    SOCKS_HOST="$new_host"
+                    log_info "Host updated to: $SOCKS_HOST"
+                    read -r -p "Press Enter to continue..."
+                fi
+                ;;
+            2)
+                read -r -p "Enter SOCKS Port [$SOCKS_PORT]: " new_port
+                if [ -n "$new_port" ] && [ "$new_port" -gt 0 ] 2>/dev/null; then
+                    SOCKS_PORT="$new_port"
+                    log_info "Port updated to: $SOCKS_PORT"
+                    read -r -p "Press Enter to continue..."
+                fi
+                ;;
+            3)
+                read -r -p "Enter IP Renewal Interval in seconds [$INTERVAL]: " new_interval
+                if [ -n "$new_interval" ] && [ "$new_interval" -ge 0 ] 2>/dev/null; then
+                    INTERVAL="$new_interval"
+                    log_info "Interval updated to: ${INTERVAL}s"
+                    read -r -p "Press Enter to continue..."
+                fi
+                ;;
+            4)
+                save_config
+                read -r -p "Press Enter to continue..."
+                ;;
+            5)
+                SOCKS_HOST="127.0.0.1"
+                SOCKS_PORT="9050"
+                INTERVAL=60
+                log_info "Reset to default settings."
+                read -r -p "Press Enter to continue..."
+                ;;
+            6)
+                return
+                ;;
+            *)
+                echo "Invalid option."
+                sleep 1
+                ;;
+        esac
+    done
+}
+
+# --- Service Management Menu ---
+
+service_menu() {
+    print_banner
+    echo -e "${CYAN}=== Service Management ===${NC}"
+    echo ""
+    
+    # Check Tor service status
+    if command -v systemctl &> /dev/null; then
+        local tor_status
+        if systemctl is-active --quiet tor 2>/dev/null; then
+            tor_status="${GREEN}Running${NC}"
+        elif systemctl is-active --quiet tor@default 2>/dev/null; then
+            tor_status="${GREEN}Running${NC}"
+        else
+            tor_status="${RED}Stopped${NC}"
+        fi
+        echo -e "Tor Service Status: $tor_status"
+        
+        # Check TorDaemon service status
+        local tord_status tord_enabled
+        if systemctl is-active --quiet tord 2>/dev/null; then
+            tord_status="${GREEN}Running${NC}"
+        else
+            tord_status="${RED}Stopped${NC}"
+        fi
+        if systemctl is-enabled --quiet tord 2>/dev/null; then
+            tord_enabled="${GREEN}Enabled${NC}"
+        else
+            tord_enabled="${YELLOW}Disabled${NC}"
+        fi
+        echo -e "TorDaemon Service Status: $tord_status (Boot: $tord_enabled)"
+    fi
+    
+    echo ""
+    echo "Tor Service:"
+    echo "  1. Start Tor Service"
+    echo "  2. Stop Tor Service"
+    echo "  3. Restart Tor Service"
+    echo "  4. Enable Tor on Boot"
+    echo "  5. Disable Tor on Boot"
+    echo ""
+    echo "TorDaemon Service:"
+    echo "  6. Install TorDaemon Service (systemd)"
+    echo "  7. Uninstall TorDaemon Service"
+    echo "  8. Enable TorDaemon on Boot"
+    echo "  9. Disable TorDaemon on Boot"
+    echo "  10. Start TorDaemon Service"
+    echo "  11. Stop TorDaemon Service"
+    echo ""
+    echo "  12. Uninstall TorDaemon"
+    echo "  13. Back to Main Menu"
+    echo ""
+    read -r -p "Select option: " choice
+    
+    case "$choice" in
+        1)
+            log_info "Starting Tor service..."
+            if command -v systemctl &> /dev/null; then
+                sudo systemctl start tor 2>/dev/null || sudo systemctl start tor@default 2>/dev/null
+            elif command -v brew &> /dev/null; then
+                brew services start tor
+            fi
+            log_info "Done."
+            read -r -p "Press Enter to continue..."
+            service_menu
+            ;;
+        2)
+            log_info "Stopping Tor service..."
+            if command -v systemctl &> /dev/null; then
+                sudo systemctl stop tor 2>/dev/null || sudo systemctl stop tor@default 2>/dev/null
+            elif command -v brew &> /dev/null; then
+                brew services stop tor
+            fi
+            log_info "Done."
+            read -r -p "Press Enter to continue..."
+            service_menu
+            ;;
+        3)
+            log_info "Restarting Tor service..."
+            if command -v systemctl &> /dev/null; then
+                sudo systemctl restart tor 2>/dev/null || sudo systemctl restart tor@default 2>/dev/null
+            elif command -v brew &> /dev/null; then
+                brew services restart tor
+            fi
+            log_info "Done."
+            read -r -p "Press Enter to continue..."
+            service_menu
+            ;;
+        4)
+            log_info "Enabling Tor on boot..."
+            if command -v systemctl &> /dev/null; then
+                sudo systemctl enable tor 2>/dev/null || sudo systemctl enable tor@default 2>/dev/null
+                log_info "Tor will start on boot."
+            else
+                log_warn "systemctl not available."
+            fi
+            read -r -p "Press Enter to continue..."
+            service_menu
+            ;;
+        5)
+            log_info "Disabling Tor on boot..."
+            if command -v systemctl &> /dev/null; then
+                sudo systemctl disable tor 2>/dev/null || sudo systemctl disable tor@default 2>/dev/null
+                log_info "Tor will not start on boot."
+            else
+                log_warn "systemctl not available."
+            fi
+            read -r -p "Press Enter to continue..."
+            service_menu
+            ;;
+        6)
+            log_info "Installing TorDaemon systemd service..."
+            if ! command -v systemctl &> /dev/null; then
+                log_error "systemctl not found. Systemd is required."
+                read -r -p "Press Enter to continue..."
+                service_menu
+                return
+            fi
+            
+            sudo tee /etc/systemd/system/tord.service > /dev/null <<EOF
+[Unit]
+Description=TorDaemon - Automatic Tor IP Rotator
+After=network.target tor.service
+Wants=tor.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/tord -t 60
+Restart=on-failure
+RestartSec=10
+StandardOutput=append:$LOG_FILE
+StandardError=append:$LOG_FILE
+
+[Install]
+WantedBy=multi-user.target
+EOF
+            sudo systemctl daemon-reload
+            log_info "TorDaemon service installed successfully."
+            log_info "Use 'sudo systemctl enable tord' to enable on boot."
+            log_info "Use 'sudo systemctl start tord' to start now."
+            read -r -p "Press Enter to continue..."
+            service_menu
+            ;;
+        7)
+            log_info "Uninstalling TorDaemon systemd service..."
+            sudo systemctl stop tord 2>/dev/null
+            sudo systemctl disable tord 2>/dev/null
+            sudo rm -f /etc/systemd/system/tord.service
+            sudo systemctl daemon-reload
+            log_info "TorDaemon service uninstalled."
+            read -r -p "Press Enter to continue..."
+            service_menu
+            ;;
+        8)
+            log_info "Enabling TorDaemon on boot..."
+            if command -v systemctl &> /dev/null; then
+                sudo systemctl enable tord
+                log_info "TorDaemon will start on boot."
+            else
+                log_warn "systemctl not available."
+            fi
+            read -r -p "Press Enter to continue..."
+            service_menu
+            ;;
+        9)
+            log_info "Disabling TorDaemon on boot..."
+            if command -v systemctl &> /dev/null; then
+                sudo systemctl disable tord
+                log_info "TorDaemon will not start on boot."
+            else
+                log_warn "systemctl not available."
+            fi
+            read -r -p "Press Enter to continue..."
+            service_menu
+            ;;
+        10)
+            log_info "Starting TorDaemon service..."
+            if command -v systemctl &> /dev/null; then
+                sudo systemctl start tord
+                log_info "Done. Check status with: sudo systemctl status tord"
+            else
+                log_warn "systemctl not available."
+            fi
+            read -r -p "Press Enter to continue..."
+            service_menu
+            ;;
+        11)
+            log_info "Stopping TorDaemon service..."
+            if command -v systemctl &> /dev/null; then
+                sudo systemctl stop tord
+                log_info "Done."
+            else
+                log_warn "systemctl not available."
+            fi
+            read -r -p "Press Enter to continue..."
+            service_menu
+            ;;
+        12)
+            print_banner
+            log_warn "This will uninstall TorDaemon from your system."
+            read -r -p "Are you sure? [y/N] " confirm
+            if [[ "$confirm" =~ ^[Yy]$ ]]; then
+                if [ -f "/usr/local/share/tord/tord" ]; then
+                    curl -fsSL https://raw.githubusercontent.com/MoE1N/tor-daemon/main/install.sh | sudo bash -s uninstall
+                else
+                    log_error "Installation not found. Cannot uninstall."
+                fi
+                exit 0
+            fi
+            service_menu
+            ;;
+        13)
+            return
+            ;;
+        *)
+            echo "Invalid option."
+            sleep 1
+            service_menu
+            ;;
+    esac
+}
+
+# --- Main Menu ---
+
+show_menu() {
+    print_banner
+    echo "1. Run (Active Mode - Change IP periodically)"
+    echo "2. Run (Passive Mode - Maintain connection)"
+    echo "3. Change IP Now"
+    echo "4. Configuration"
+    echo "5. Service Management"
+    echo "6. Exit"
+    echo
+    read -r -p "Select option: " choice
+    case "$choice" in
+        1) 
+            read -r -p "Enter Interval (seconds) [$INTERVAL]: " user_int
+            user_int=${user_int:-$INTERVAL}
+            run_loop "$user_int"
+            ;;
+        2)
+            run_loop 0
+            ;;
+        3)
+            change_ip_routine
+            read -r -p "Press Enter to continue..."
+            show_menu
+            ;;
+        4)
+            config_menu
+            show_menu
+            ;;
+        5)
+            service_menu
+            show_menu
+            ;;
+        6) 
+            exit 0 
+            ;;
+        *) 
+            echo "Invalid option." 
+            sleep 1
+            show_menu 
+            ;;
+    esac
+}
+
+# --- Main ---
+
+TIME_INTERVAL=$INTERVAL
+DAEMON_MODE=false
+
+while [[ "$#" -gt 0 ]]; do
+    case $1 in
+        -t|--time) TIME_INTERVAL="$2"; shift ;;
+        -d|--daemon) DAEMON_MODE=true ;; # Basic background support
+        -h|--help) 
+            echo "TorDaemon (tord) - Automatic Tor IP Rotator"
+            echo ""
+            echo "Usage: tord [OPTIONS]"
+            echo ""
+            echo "Options:"
+            echo "  -t, --time SECONDS    Set IP rotation interval (0 = passive mode)"
+            echo "  -d, --daemon          Run as background daemon"
+            echo "  -h, --help            Show this help message"
+            echo ""
+            echo "Systemd Service Commands:"
+            echo "  sudo systemctl enable $SERVICE_NAME    Enable TorDaemon on startup"
+            echo "  sudo systemctl disable $SERVICE_NAME   Disable TorDaemon on startup"
+            echo "  sudo systemctl start $SERVICE_NAME     Start TorDaemon service"
+            echo "  sudo systemctl stop $SERVICE_NAME      Stop TorDaemon service"
+            echo "  sudo systemctl status $SERVICE_NAME    Check service status"
+            echo ""
+            echo "Examples:"
+            echo "  tord                   Launch interactive menu"
+            echo "  tord -t 60             Rotate IP every 60 seconds"
+            echo "  tord -t 0              Passive mode (only on disconnect)"
+            echo "  tord -d                Run in background daemon mode"
+            echo ""
+            exit 0
+            ;;
+        *) echo "Unknown: $1"; exit 1 ;;
+    esac
+    shift
+done
+
+load_config
+check_dependencies
+check_tor
+
+# Handle daemon cleanup
+cleanup_daemon() {
+    if [ -f "$PID_FILE" ] && [ "$$" = "$(cat "$PID_FILE" 2>/dev/null)" ]; then
+        rm -f "$PID_FILE"
+    fi
+}
+
+# If daemon mode is enabled, fork to background
+if [ "$DAEMON_MODE" = true ]; then
+    # Check if already running
+    if [ -f "$PID_FILE" ]; then
+        old_pid=$(cat "$PID_FILE")
+        if ps -p "$old_pid" > /dev/null 2>&1; then
+            echo "TorDaemon is already running (PID: $old_pid)"
+            echo "Stop it first with: sudo kill $old_pid"
+            exit 1
+        fi
+    fi
+    
+    # Fork to background
+    echo "Starting TorDaemon in daemon mode..."
+    nohup "$0" -t "$TIME_INTERVAL" >> "$LOG_FILE" 2>&1 &
+    daemon_pid=$!
+    echo $daemon_pid > "$PID_FILE"
+    echo "TorDaemon started with PID: $daemon_pid"
+    echo "Log file: $LOG_FILE"
+    echo "Stop with: sudo kill $daemon_pid"
+    exit 0
+fi
+
+trap cleanup_daemon EXIT
+
+# If arguments provided (e.g. interval), skip menu
+if [ "$#" -ne 0 ] || [ -n "$TIME_INTERVAL" ] && [ "$TIME_INTERVAL" != "$INTERVAL" ]; then
+    run_loop "$TIME_INTERVAL"
+else
+    show_menu
+fi
